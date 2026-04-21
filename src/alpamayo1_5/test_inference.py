@@ -16,7 +16,12 @@
 """End-to-end example script for the inference pipeline.
 
 Loads a dataset, runs inference, and computes the minADE.
+
+Set ``ALPAMAYO_DEBUG=0`` to silence DEBUG logs from the ``alpamayo1_5`` package.
 """
+
+import logging
+import os
 
 import numpy as np
 import torch
@@ -28,6 +33,13 @@ from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 
 def main() -> None:
     """Run inference on an example clip and report minADE."""
+    if os.environ.get("ALPAMAYO_DEBUG", "1").lower() not in ("0", "false", "no"):
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s [%(name)s] %(message)s",
+        )
+        logging.getLogger("alpamayo1_5").setLevel(logging.DEBUG)
+
     clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
     print(f"Loading dataset for clip_id: {clip_id}...")
     data = load_physical_aiavdataset(clip_id, t0_us=5_100_000)

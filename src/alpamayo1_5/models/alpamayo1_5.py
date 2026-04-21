@@ -232,6 +232,8 @@ class Alpamayo1_5(ReasoningVLA):
             temperature: The temperature for sampling.
             num_traj_samples: The number of trajectory samples.
             num_traj_sets: The number of trajectory sets.
+            diffusion_kwargs: Forwarded to ``self.diffusion.sample`` (e.g. ``inference_step``,
+                ``denoising_guidance_fn`` for classifier steering; see ``alpamayo1_5.steering``).
             *args: Variable length argument list.
             **kwargs: Arbitrary keyword arguments.
 
@@ -324,6 +326,8 @@ class Alpamayo1_5(ReasoningVLA):
         if self.config.expert_non_causal_attention:
             forward_kwargs["is_causal"] = False
 
+        _expert_step_call = [0]
+
         # 2) Define denoising step that consumes noisy action and timestep
         def step_fn(
             x: torch.Tensor,
@@ -331,6 +335,7 @@ class Alpamayo1_5(ReasoningVLA):
         ) -> torch.Tensor:
             # x: (B*, *action_dim)
             # t: broadcastable to x leading dims
+            _expert_step_call[0] += 1
             b_star = x.shape[0]
             # Project noisy action to expert token embeddings for the n future tokens
             # Expect shape (b*, n_token_per_traj, hidden_size)
@@ -354,6 +359,19 @@ class Alpamayo1_5(ReasoningVLA):
             pred = self.action_out_proj(last_hidden).view(
                 -1, *self.action_space.get_action_space_dims()
             )  # (b*, Tf, C_action) -> noise/vector field
+            if logger.isEnabledFor(logging.DEBUG):
+                t0 = float(t.reshape(-1)[0].detach().float().cpu()) if t.numel() else 0.0
+                logger.debug(
+                    "expert step_fn call=%d x_shape=%s t=%.5f x_mean=%.4f x_std=%.4f "
+                    "pred_mean=%.4f pred_std=%.4f",
+                    _expert_step_call[0],
+                    tuple(x.shape),
+                    t0,
+                    float(x.detach().float().mean().cpu()),
+                    float(x.detach().float().std().cpu()),
+                    float(pred.detach().float().mean().cpu()),
+                    float(pred.detach().float().std().cpu()),
+                )
             return pred
 
         # 3) Diffusion sampling in action space with multiple samples per input
@@ -599,6 +617,8 @@ class Alpamayo1_5(ReasoningVLA):
         if self.config.expert_non_causal_attention:
             forward_kwargs["is_causal"] = False
 
+        _expert_step_call_cfg = [0]
+
         # 3) Define denoising step that consumes noisy action and timestep
         def step_fn(
             x: torch.Tensor,
@@ -609,6 +629,7 @@ class Alpamayo1_5(ReasoningVLA):
         ) -> torch.Tensor:
             # x: (B*, *action_dim)
             # t: broadcastable to x leading dims
+            _expert_step_call_cfg[0] += 1
             b_star = x.shape[0]
             # Project noisy action to expert token embeddings for the n future tokens
             # Expect shape (b*, n_token_per_traj, hidden_size)
@@ -633,6 +654,19 @@ class Alpamayo1_5(ReasoningVLA):
             pred = self.action_out_proj(last_hidden).view(
                 -1, *self.action_space.get_action_space_dims()
             )  # (b*, Tf, C_action) -> noise/vector field
+            if logger.isEnabledFor(logging.DEBUG):
+                t0 = float(t.reshape(-1)[0].detach().float().cpu()) if t.numel() else 0.0
+                logger.debug(
+                    "expert step_fn (cfg_nav) call=%d x_shape=%s t=%.5f x_mean=%.4f x_std=%.4f "
+                    "pred_mean=%.4f pred_std=%.4f",
+                    _expert_step_call_cfg[0],
+                    tuple(x.shape),
+                    t0,
+                    float(x.detach().float().mean().cpu()),
+                    float(x.detach().float().std().cpu()),
+                    float(pred.detach().float().mean().cpu()),
+                    float(pred.detach().float().std().cpu()),
+                )
             return pred
 
         # 4) Diffusion sampling in action space with multiple samples per input

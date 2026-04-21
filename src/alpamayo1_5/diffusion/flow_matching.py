@@ -13,10 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+from collections.abc import Callable
 from typing import Literal
 
 import torch
 from alpamayo1_5.diffusion.base import BaseDiffusion, StepFn
+
+logger = logging.getLogger(__name__)
 
 
 class FlowMatching(BaseDiffusion):
@@ -62,6 +66,7 @@ class FlowMatching(BaseDiffusion):
         use_classifier_free_guidance: bool | None = None,
         inference_guidance_weight: float | None = None,
         temperature: float = 1.0,
+        denoising_guidance_fn: Callable[..., torch.Tensor] | None = None,
         *args,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -82,6 +87,8 @@ class FlowMatching(BaseDiffusion):
             inference_guidance_weight: The weight of the guidance during inference. (override self.inference_guidance_weight)
             temperature: The temperature for controlling the initial noise. Note that using
                 temperature < 1.0 will result in a more stable sampling with less diversity.
+            denoising_guidance_fn: Optional ``f(x, t, v, step_index) -> delta_v`` added to the
+                flow velocity each Euler step (e.g. λ ∇_x log p(class | x, t)).
 
         Returns:
             torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -107,6 +114,7 @@ class FlowMatching(BaseDiffusion):
                 inference_guidance_weight=inference_guidance_weight,
                 use_classifier_free_guidance=use_classifier_free_guidance,
                 temperature=temperature,
+                denoising_guidance_fn=denoising_guidance_fn,
             )
         else:
             raise ValueError(f"Invalid integration method: {int_method}")
@@ -146,6 +154,7 @@ class FlowMatching(BaseDiffusion):
         inference_guidance_weight: float | None = None,
         use_classifier_free_guidance: bool | None = None,
         temperature: float = 1.0,
+        denoising_guidance_fn: Callable[..., torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Euler integration for flow matching.
 
@@ -163,6 +172,7 @@ class FlowMatching(BaseDiffusion):
             use_classifier_free_guidance: Whether to use classifier free guidance.
             temperature: The temperature for controlling the initial noise. Note that using
                 temperature < 1.0 will result in a more stable sampling with less diversity.
+            denoising_guidance_fn: Optional per-step velocity correction.
         Returns:
             torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
                 The final sampled tensor [B, *x_dims] if return_all_steps is False,
@@ -188,7 +198,26 @@ class FlowMatching(BaseDiffusion):
                 )
             else:
                 v = step_fn(x=x, t=t_start)
+            if denoising_guidance_fn is not None:
+                v = v + denoising_guidance_fn(
+                    x=x, t=t_start, v=v, step_index=i
+                )
             x = x + dt * v
+            if logger.isEnabledFor(logging.DEBUG):
+                t0 = float(t_start.reshape(-1)[0].detach().float().cpu())
+                dtf = float(dt.reshape(-1)[0].detach().float().cpu())
+                logger.debug(
+                    "flow_matching euler step %d/%d t_start=%.5f dt=%.5f "
+                    "x_mean=%.4f x_std=%.4f v_mean=%.4f v_std=%.4f",
+                    i + 1,
+                    inference_step,
+                    t0,
+                    dtf,
+                    float(x.detach().float().mean().cpu()),
+                    float(x.detach().float().std().cpu()),
+                    float(v.detach().float().mean().cpu()),
+                    float(v.detach().float().std().cpu()),
+                )
             if return_all_steps:
                 all_steps.append(x)
         if return_all_steps:
