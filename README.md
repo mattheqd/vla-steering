@@ -12,6 +12,8 @@
 **📖 Please read the [HuggingFace Model Card](https://huggingface.co/nvidia/Alpamayo-1.5-10B) first!**
 The model card contains comprehensive details on model architecture, inputs/outputs, licensing, and tested hardware configurations. This GitHub README focuses on setup, usage, and frequently asked questions.
 
+**Research fork (USC):** this checkout extends the upstream Alpamayo 1.5 codebase with **inference-time steering in trajectory space** via **denoising-time classifier guidance** on the flow-matching expert. See [Research extension: denoising-time trajectory steering](#research-extension-denoising-time-trajectory-steering-usc) for motivation, design, and how to reproduce experiments.
+
 ## Prerequisites
 
 - **NVIDIA GPU** with CUDA support
@@ -91,10 +93,86 @@ Alpamayo 1.5 provides two inference methods:
 
 - **`generate_text`** -- Text-only generation for visual question answering (VQA). Returns extracted text fields.
 
+### Denoising-time guidance (research)
+
+The flow-matching sampler (`src/alpamayo1_5/diffusion/flow_matching.py`) accepts an optional **`denoising_guidance_fn(x, t, v, step_index) -> delta_v`**. Each Euler step becomes **`v ← v + delta_v`** then **`x ← x + dt · v`**. Pass it through **`diffusion_kwargs`** when calling **`sample_trajectories_from_data_with_vlm_rollout`**:
+
+```python
+from alpamayo1_5.steering import HeuristicBehaviorClassifier, classifier_gradient_guidance_fn
+
+clf = HeuristicBehaviorClassifier().to("cuda")
+guidance = classifier_gradient_guidance_fn(clf, target_class=0, scale=0.15)
+
+pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+    data=model_inputs,
+    diffusion_kwargs={"denoising_guidance_fn": guidance},
+    # ... other kwargs unchanged ...
+)
+```
+
+**A/B script** (baseline vs guided on one Physical AI clip, same RNG reset per run):
+
+```bash
+# Quieter logs
+ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py
+
+# Stronger intervention (tune carefully)
+ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py --guidance-scale 0.5 --target-class 0
+```
+
+`--target-class` indexes the heuristic prototype: **0** ≈ yield-ish (negative mean accel), **1** neutral, **2** accel-ish. **`--deterministic`** enables stricter cuDNN settings when you need more reproducible A/Bs.
+
+## Research extension: denoising-time trajectory steering (USC)
+
+### Goal
+
+We study **where to intervene** in a Vision-Language-Action (VLA) stack that first writes a **Chain-of-Causation (CoC)** with a VLM, then samples a **continuous trajectory** with a **separate action expert**. Prior work (and our own architectural analysis) suggests that **editing reasoning tokens or the KV cache** can yield **inconsistent** trajectory effects, may push the expert **off-distribution**, and confounds **faithfulness** questions about CoC text.
+
+Our primary direction is **trajectory-level control inside the expert’s denoising loop**: at each flow-matching step, augment the learned vector field with a **classifier score gradient**:
+
+$$v \leftarrow v + \lambda \, \nabla_x \log p_C(y \mid x, t)$$
+
+Here **`x`** is the noisy action tensor (normalized unicycle accel/curvature over 64 waypoints), **`t`** is flow time in **`[0, 1]`**, **`y`** is a target **behavioral** class, and **`C`** is a lightweight classifier. The VLM, CoC text, and **frozen `past_key_values`** are **unchanged**; only the **Euler integration** over actions is steered. This matches the “denoising-time guidance” formulation in our group’s midterm report and keeps the expert conditioned on **in-distribution** visual + reasoning context.
+
+### What the upstream model already does (relevant pieces)
+
+1. **VLM (`Qwen3VLForConditionalGeneration`)** consumes multi-camera images, ego history tokens fused into the prompt, and autoregressively generates **CoC** until a **`<|traj_future_start|>`** stop; discrete future-trajectory logits are masked during that phase.
+2. The resulting **KV cache** is reused by a **second transformer (“expert”)** without its own token embedding layer. For each flow step, **`action_in_proj(x, t)`** builds query embeddings; the expert attends to the cache; **`action_out_proj`** maps hidden states back to a **velocity field** in action space.
+3. **`FlowMatching`** integrates that field with **fixed-step Euler** from **`t = 0`** to **`t = 1`** (default 10 steps in released configs unless overridden).
+
+Our extension sits strictly in step (3), optionally modifying **`v`** after the expert forward.
+
+### What we implemented in this repo
+
+| Piece | Role |
+| ----- | ---- |
+| **`FlowMatching.sample` / `_euler`** | Optional **`denoising_guidance_fn`**; gradient-based **`delta_v`** is added to **`v`** each step. |
+| **`alpamayo1_5/steering/`** | **`HeuristicBehaviorClassifier`**: differentiable **3-class** logits from **pooled (mean accel, mean curvature)** vs fixed prototypes (stand-in until **\(C\)** is trained on Physical AI). **`classifier_gradient_guidance_fn`** wraps it as a **`denoising_guidance_fn`**. |
+| **`compare_denoising_guidance.py`** | Loads the default example clip, runs **baseline** then **guided** with **`torch.cuda.manual_seed_all`** (and friends) reset to the same seed before each full **`sample_trajectories_from_data_with_vlm_rollout`**, prints **minADE**, **FDE**, mean XY step length, and deltas. |
+| **`test_inference.py`** | Optional **`ALPAMAYO_DEBUG`** logging for the expert + Euler loop (see script docstring). |
+| **`tests/test_denoising_guidance.py`** | Unit tests for the guidance hook and tensor shapes. |
+
+**Important:** the shipped **`HeuristicBehaviorClassifier`** is for **pipeline debugging and coarse steering experiments**, not a substitute for a **dataset-trained, noise-conditioned `C(x, t)`** as in the full research plan.
+
+### Preliminary observations (single-clip sanity checks)
+
+On the default Physical AI example clip, with **identical CoC** between A/B and matched noise at the first Euler step:
+
+- A modest **`scale`** (e.g. **0.15**, **`target_class=0`**) produced small **improvements** in **minADE / FDE** vs ground truth in our script’s metrics.
+- A larger **`scale`** (e.g. **0.5**) increased the **magnitude of `v`** corrections and produced **larger** **ΔminADE / ΔFDE** on that clip.
+
+These results **do not** generalize beyond the tested scenario; they only validate that the **hook is live** and **λ scales the intervention** as expected.
+
+### Next steps (research roadmap)
+
+1. **Train `C(x, t)`** on Physical AI AV with noisy actions from the **forward** flow and **behavior labels** aligned to CoC vocabulary.
+2. **Sweep `λ`** and optional **time schedules** (early vs late denoising); measure **behavioral hit rate** vs **minADE/minFDE** tradeoffs (evaluation protocol in the midterm).
+3. **Scale** to scenario strata (nominal vs long-tail) and compare against **reasoning-level** interventions.
+
 ## Project Structure
 
 ```
-alpamayo_1.5_release/
+alpamayo1.5/
 ├── notebooks/
 │   ├── inference.ipynb                  # Standard model inference
 │   ├── inference_cam_num.ipynb          # Inference with different camera counts
@@ -103,18 +181,23 @@ alpamayo_1.5_release/
 ├── src/
 │   └── alpamayo1_5/
 │       ├── action_space/
-│       │   └── ...                      # Action space definitions
+│       │   └── ...                      # Action space definitions (unicycle accel/curvature)
 │       ├── diffusion/
-│       │   └── ...                      # Diffusion model components
+│       │   └── flow_matching.py         # Euler flow matching (+ optional denoising guidance)
 │       ├── geometry/
 │       │   └── ...                      # Geometry utilities and modules
 │       ├── models/
-│       │   ├── ...                      # Model components and utils functions
+│       │   └── ...                      # Alpamayo1_5, VLM + expert, rollout API
+│       ├── steering/
+│       │   └── denoising_guidance.py    # Heuristic classifier + gradient guidance factory
 │       ├── __init__.py                  # Package marker
+│       ├── compare_denoising_guidance.py # A/B: baseline vs guided trajectory sampling
 │       ├── config.py                    # Model and experiment configuration
 │       ├── helper.py                    # Utility functions
 │       ├── load_physical_aiavdataset.py # Dataset loader
-│       ├── test_inference.py            # Inference test script
+│       └── test_inference.py            # End-to-end inference smoke test
+├── tests/
+│   └── test_denoising_guidance.py       # Unit tests for guidance hook
 ├── pyproject.toml                       # Project dependencies
 └── uv.lock                              # Locked dependency versions
 ```
