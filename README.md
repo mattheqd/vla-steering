@@ -110,7 +110,7 @@ pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout
 )
 ```
 
-**Experiment runner** (`compare_denoising_guidance.py`): baseline vs guided on one Physical AI clip, **same RNG reset** before each full `sample_trajectories_from_data_with_vlm_rollout`. Optional **`--log-results`** appends structured rows to CSV and per-arm JSON; optional **`--save-artifacts`** writes compact **`results/artifacts/pair_<pair_id>.npz`** (XY polylines) and **`pair_<pair_id>_meta.json`** for plotting.
+**Experiment runner** (`compare_denoising_guidance.py`): baseline vs guided on one Physical AI clip, **same RNG reset** before each full `sample_trajectories_from_data_with_vlm_rollout`. Optional **`--log-results`** appends structured rows to CSV and per-arm JSON; optional **`--save-artifacts`** writes compact **`results/artifacts/pair_<pair_id>.npz`** (XY polylines) and **`pair_<pair_id>_meta.json`** for plotting. When logging, each arm also records **behavior-oriented trajectory summaries** (speeds, lateral extent, heading change, optional point clearance, time-to-first sub-threshold speed) from the **predicted** polyline—see [Behavior metrics (logged)](#behavior-metrics-logged) below. **`--trajectory-dt`** (default **0.1** s) sets the uniform step used for speed/time; **`--obstacle-xy X Y`** supplies an ego-frame point for clearance (omit to log null/empty for that column). After each pair, the runner prints a **compact metrics table** (baseline / guided / deltas) similar to the sweep summary.
 
 ```bash
 # Quieter logs
@@ -137,7 +137,23 @@ ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py \
 
 # Plot a saved artifact (default aspect mode is “readable”; use --aspect-mode equal for 1:1 axes)
 python scripts/plot_guidance_trajectories.py --npz results/artifacts/pair_<pair_id>.npz
+
+# Log with optional ego-frame point obstacle (meters) for min-clearance column
+ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py \
+  --guidance-scale 0.3 --guidance-schedule all --target-class 0 --log-results --obstacle-xy 5.0 1.0
 ```
+
+#### Behavior metrics (logged)
+
+These are **lightweight kinematic summaries** on the **predicted XY** horizon (and rotation for heading change), **not** a substitute for scenario-specific safety or intent evaluation. They help compare baseline vs guided **trajectory shape** in the same ego frame as the model.
+
+| CSV / JSON field | Meaning (short) |
+| ---------------- | ---------------- |
+| **`mean_speed_mps`**, **`min_speed_mps`** | Mean / min segment speed from consecutive XY waypoints, using **`--trajectory-dt`**. |
+| **`max_abs_lateral_disp_m`** | Max absolute lateral offset from the initial motion direction (through the first waypoint). |
+| **`heading_change_sum_abs_rad`** | Sum of absolute wrapped yaw steps along the horizon (from **`pred_rot`** when available). |
+| **`min_clearance_obstacle_m`** | Min distance from any predicted XY point to **`--obstacle-xy`**; **null/empty** if no obstacle was passed. |
+| **`time_to_stop_s`** | First time (s) at the end of a segment whose speed falls below **0.2 m/s** (never → null/empty). |
 
 Sweeps log **one baseline row per pair** on purpose: each pair re-seeds and runs a full baseline rollout before its guided rollout, so repeated baselines are independent rerolls, not duplicate logging.
 
@@ -171,10 +187,10 @@ Our extension sits strictly in step (3), optionally modifying **`v`** after the 
 | **`alpamayo1_5/steering/`** | **`HeuristicBehaviorClassifier`**: differentiable **3-class** logits from **pooled (mean accel, mean curvature)** vs fixed prototypes — a **stand-in** for a learned **\(C(x,t)\)**. **`classifier_gradient_guidance_fn`** wraps it as a **`denoising_guidance_fn`**. **`wrap_guidance_schedule`** implements **`all`**, **`early`** (first ~40% of Euler steps), **`late`** (last ~40%). |
 | **`compare_denoising_guidance.py`** | Main **experiment runner**: baseline vs guided, **`--lambda-sweep`**, **`--schedule-sweep`**, **`--log-results`**, **`--save-artifacts`**, prints trajectory metrics and deltas. |
 | **`experiments/run_logging.py`** | **`RunRecord`** + **`save_run_record`**: append CSV under **`results/csv/`**, one JSON file per arm under **`results/json/`**. |
-| **`metrics/`** | **minADE/FDE**, XY step length, guided–baseline **trajectory shift (RMS L2 in XYZ)**, and traj-derived normalized accel/κ summaries used in logged tables. |
+| **`metrics/`** | **`trajectory_metrics.py`**: minADE/FDE, XY step length, guided–baseline **trajectory shift (RMS L2 in XYZ)**, traj-derived normalized accel/κ. **`behavior_metrics.py`**: mean/min speed, max lateral offset, heading-change sum, optional obstacle clearance, time-to-stop—used by **`compare_denoising_guidance.py`** for print + CSV/JSON. |
 | **Artifacts** | With **`--save-artifacts`**: **`results/artifacts/pair_<pair_id>.npz`** (`gt_xy`, `baseline_xy`, `guided_xy`) and **`pair_<pair_id>_meta.json`** (clip id, λ, schedule, CoC match flag, scalar metrics). |
 | **`scripts/plot_guidance_trajectories.py`** | **Matplotlib-only** 3-panel XY figure; default output **`results/figures/pair_<pair_id>.png`** (overridable with **`--output`**); **`--aspect-mode`** **`readable`** (default) or **`equal`**. |
-| **`tests/`** | **`test_denoising_guidance`**, **`test_wrap_guidance_schedule`**, **`test_trajectory_metrics`**, **`test_run_logging`** — lightweight checks on the hook, schedules, metrics, and logging. |
+| **`tests/`** | **`test_denoising_guidance`**, **`test_wrap_guidance_schedule`**, **`test_trajectory_metrics`**, **`test_behavior_metrics`**, **`test_run_logging`** — lightweight checks on the hook, schedules, metrics, and logging. |
 | **`test_inference.py`** | Optional **`ALPAMAYO_DEBUG`** logging for the expert + Euler loop (see script docstring). |
 
 **Important:** the shipped **`HeuristicBehaviorClassifier`** is for **pipeline debugging and coarse controllability experiments**, not a substitute for a **dataset-trained, noise-conditioned `C(x, t)`** as in the full research plan.
@@ -191,7 +207,7 @@ This fork is a **working prototype and experiment harness**: it validates that *
 
 **Schedule sweep (default clip, `λ = 0.3`):** **`all`** produced the **largest** guided-vs-baseline **`trajectory_shift_l2`** in our logs; **`early`** and **`late`** were **weaker and similar**, with **`late` slightly larger than `early` on this clip**.
 
-**Limitations:** findings are **single-clip** (unless you expand runs); the classifier is **heuristic**, not the target trained **\(C(x,t)\)**; **ADE/FDE** do not certify **safe or desirable** driving; sweeps **re-roll baseline per pair**, so repeated baseline rows are **intentional**, not duplicate logging.
+**Limitations:** findings are **single-clip** (unless you expand runs); the classifier is **heuristic**, not the target trained **\(C(x,t)\)**; **ADE/FDE** do not certify **safe or desirable** driving; **logged behavior metrics** are **coarse kinematic summaries** (not behavioral labels or risk metrics); sweeps **re-roll baseline per pair**, so repeated baseline rows are **intentional**, not duplicate logging.
 
 ### Next steps (research roadmap)
 
@@ -226,7 +242,8 @@ alpamayo1.5/
 │       ├── geometry/
 │       │   └── ...                      # Geometry utilities and modules
 │       ├── metrics/
-│       │   └── ...                      # Trajectory metrics used by the compare runner
+│       │   ├── trajectory_metrics.py    # minADE/FDE, shift, step length, traj→action means
+│       │   └── behavior_metrics.py      # Speed / lateral / heading / clearance / time-to-stop summaries
 │       ├── models/
 │       │   └── ...                      # Alpamayo1_5, VLM + expert, rollout API
 │       ├── steering/
@@ -240,7 +257,8 @@ alpamayo1.5/
 ├── tests/
 │   ├── test_denoising_guidance.py       # Guidance hook / wiring
 │   ├── test_wrap_guidance_schedule.py   # Schedule masking on the Euler index
-│   ├── test_trajectory_metrics.py       # Metric helpers
+│   ├── test_trajectory_metrics.py       # Geometric trajectory metrics
+│   ├── test_behavior_metrics.py         # Behavior summary helpers
 │   └── test_run_logging.py              # RunRecord + CSV/JSON serialization
 ├── pyproject.toml                       # Project dependencies
 └── uv.lock                              # Locked dependency versions
