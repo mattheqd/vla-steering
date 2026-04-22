@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import random
@@ -44,6 +45,7 @@ from alpamayo1_5.metrics import (
     min_ade_fde,
     trajectory_shift_l2,
 )
+from alpamayo1_5.metrics.behavior_metrics import summarize_pred_behavior
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 from alpamayo1_5.steering import (
     HeuristicBehaviorClassifier,
@@ -73,8 +75,11 @@ def _collect_row_metrics(
     model_inputs: dict[str, Any],
     pred_xyz: torch.Tensor,
     pred_rot: torch.Tensor,
+    *,
+    traj_dt: float,
+    obstacle_xy: np.ndarray | None,
 ) -> dict[str, float]:
-    """ADE/FDE, XY step length, and traj→action inverse statistics (see metrics docstrings)."""
+    """ADE/FDE, XY step length, traj→action inverse stats, and behavior summaries on XY."""
     gt = data["ego_future_xyz"]
     min_ade, fde = min_ade_fde(pred_xyz, gt)
     mstep = mean_xy_step_length(pred_xyz)
@@ -88,12 +93,18 @@ def _collect_row_metrics(
         )
     except Exception:
         ma, mk = float("nan"), float("nan")
+    traj_xy = pred_xyz.detach().float().cpu().numpy()[0, 0, 0, :, :2]
+    rot_np = pred_rot.detach().float().cpu().numpy()[0, 0, 0, :, :, :]
+    beh = summarize_pred_behavior(
+        traj_xy, traj_dt, pred_rot=rot_np, obstacle_xy=obstacle_xy
+    )
     return {
         "min_ade_m": min_ade,
         "fde_m": fde,
         "mean_step_xy_m": mstep,
         "mean_norm_accel_from_pred_traj": ma,
         "mean_norm_kappa_from_pred_traj": mk,
+        **beh,
     }
 
 
@@ -196,13 +207,97 @@ def _build_guidance_fn(
     )
 
 
-def _print_metrics_line(prefix: str, metrics: dict[str, float]) -> None:
-    print(
-        f"{prefix}minADE={metrics['min_ade_m']:.4f} m  FDE={metrics['fde_m']:.4f} m  "
-        f"mean_xy_step={metrics['mean_step_xy_m']:.4f} m  "
-        f"mean_norm_accel(traj→action)={metrics['mean_norm_accel_from_pred_traj']:.4f}  "
-        f"mean_norm_kappa(traj→action)={metrics['mean_norm_kappa_from_pred_traj']:.4f}"
+def _fmt_metric(x: float, *, width: int = 7, prec: int = 3) -> str:
+    if isinstance(x, float) and math.isnan(x):
+        return " " * max(0, width - 3) + "nan"
+    return f"{x:>{width}.{prec}f}"
+
+
+def _fmt_delta(x: float, *, width: int = 8, prec: int = 4) -> str:
+    if isinstance(x, float) and math.isnan(x):
+        return " " * max(0, width - 3) + "nan"
+    s = f"{x:+.{prec}f}"
+    return s.rjust(width)
+
+
+def _short_coc_preview(coc_first: Any, max_len: int = 92) -> str:
+    s = str(coc_first).replace("\n", " ").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+
+def _print_pair_metrics_table(
+    *,
+    pair_label: str,
+    guidance_schedule: str,
+    guidance_scale: float,
+    metrics_a: dict[str, float],
+    metrics_b: dict[str, float],
+    shift_l2: float,
+    coc_match: bool,
+    coc_preview: str,
+) -> None:
+    """Single aligned block: geo + behavior + deltas (sweep-summary style)."""
+    delta_label = "delta (G-B)"
+    aw = max(10, len(pair_label), len(delta_label))
+    hdr = (
+        f"\n=== {pair_label}  |  sched={guidance_schedule}  |  λ={guidance_scale:g} ===\n"
+        f"CoC match: {'yes' if coc_match else 'no'}    preview: {_short_coc_preview(coc_preview)}\n"
+        f"{'arm':<{aw}}"
+        f"  {'minADE':>7}  {'FDE':>7}  {'step':>6}"
+        f"  {'v_avg':>6}  {'v_min':>6}  {'|lat|':>6}  {'d_hdg':>6}  {'clr':>6}  {'tstp':>6}"
+        f"  {'a_tr':>5}  {'k_tr':>5}"
     )
+    print(hdr)
+    print(" " * aw + "  " + "-" * 72)
+
+    def row(label: str, m: dict[str, float]) -> None:
+        print(
+            f"{label:<{aw}}"
+            f"  {_fmt_metric(m['min_ade_m'], width=7, prec=4)}  {_fmt_metric(m['fde_m'], width=7, prec=4)}"
+            f"  {_fmt_metric(m['mean_step_xy_m'], width=6, prec=4)}"
+            f"  {_fmt_metric(m['mean_speed_mps'], width=6)}  {_fmt_metric(m['min_speed_mps'], width=6)}"
+            f"  {_fmt_metric(m['max_abs_lateral_disp_m'], width=6)}"
+            f"  {_fmt_metric(m['heading_change_sum_abs_rad'], width=6)}"
+            f"  {_fmt_metric(m['min_clearance_obstacle_m'], width=6)}"
+            f"  {_fmt_metric(m['time_to_stop_s'], width=6)}"
+            f"  {_fmt_metric(m['mean_norm_accel_from_pred_traj'], width=5)}"
+            f"  {_fmt_metric(m['mean_norm_kappa_from_pred_traj'], width=5)}"
+        )
+
+    row("baseline", metrics_a)
+    row("guided", metrics_b)
+
+    keys = [
+        "min_ade_m",
+        "fde_m",
+        "mean_step_xy_m",
+        "mean_speed_mps",
+        "min_speed_mps",
+        "max_abs_lateral_disp_m",
+        "heading_change_sum_abs_rad",
+        "min_clearance_obstacle_m",
+        "time_to_stop_s",
+        "mean_norm_accel_from_pred_traj",
+        "mean_norm_kappa_from_pred_traj",
+    ]
+    d = {k: metrics_b[k] - metrics_a[k] for k in keys}
+    print(
+        f"{delta_label:<{aw}}"
+        f"  {_fmt_delta(d['min_ade_m'], width=8, prec=4)}  {_fmt_delta(d['fde_m'], width=8, prec=4)}"
+        f"  {_fmt_delta(d['mean_step_xy_m'], width=7, prec=4)}"
+        f"  {_fmt_delta(d['mean_speed_mps'], width=7, prec=3)}  {_fmt_delta(d['min_speed_mps'], width=7, prec=3)}"
+        f"  {_fmt_delta(d['max_abs_lateral_disp_m'], width=7, prec=3)}"
+        f"  {_fmt_delta(d['heading_change_sum_abs_rad'], width=7, prec=3)}"
+        f"  {_fmt_delta(d['min_clearance_obstacle_m'], width=7, prec=3)}"
+        f"  {_fmt_delta(d['time_to_stop_s'], width=7, prec=3)}"
+        f"  {_fmt_delta(d['mean_norm_accel_from_pred_traj'], width=6, prec=3)}"
+        f"  {_fmt_delta(d['mean_norm_kappa_from_pred_traj'], width=6, prec=3)}"
+    )
+    print(f"pair traj_shift_L2 (XYZ RMS, m): {shift_l2:.4f}")
+    if not coc_match:
+        print("Tip: use --deterministic for stricter CoC repeatability between arms.")
 
 
 @dataclass
@@ -235,6 +330,8 @@ def _run_baseline_guided_pair(
     deterministic: bool,
     clip_id: str,
     seed: int,
+    traj_dt: float,
+    obstacle_xy: np.ndarray | None,
 ) -> PairSummary:
     """One baseline + one guided rollout (RNG reset before each). Logs two records when requested."""
     _set_global_seed(seed)
@@ -248,10 +345,10 @@ def _run_baseline_guided_pair(
             return_extra=True,
             diffusion_kwargs=None,
         )
-    metrics_a = _collect_row_metrics(model, data, model_inputs, pred_a, pred_rot_a)
-    print(f"\n--- {pair_label} | baseline ---")
-    print("CoC snippet:", extra_a["cot"][0])
-    _print_metrics_line("", metrics_a)
+    metrics_a = _collect_row_metrics(
+        model, data, model_inputs, pred_a, pred_rot_a, traj_dt=traj_dt, obstacle_xy=obstacle_xy
+    )
+    print("  baseline done -> running guided ...")
 
     gn = _build_guidance_fn(clf, target_class, guidance_scale, guidance_schedule, model)
     _set_global_seed(seed)
@@ -265,28 +362,29 @@ def _run_baseline_guided_pair(
             return_extra=True,
             diffusion_kwargs={"denoising_guidance_fn": gn},
         )
-    metrics_b = _collect_row_metrics(model, data, model_inputs, pred_b, pred_rot_b)
-    print(f"--- {pair_label} | guided (schedule={guidance_schedule}, λ={guidance_scale}) ---")
-    print("CoC snippet:", extra_b["cot"][0])
-    _print_metrics_line("", metrics_b)
+    metrics_b = _collect_row_metrics(
+        model, data, model_inputs, pred_b, pred_rot_b, traj_dt=traj_dt, obstacle_xy=obstacle_xy
+    )
 
     d_ade = metrics_b["min_ade_m"] - metrics_a["min_ade_m"]
     d_fde = metrics_b["fde_m"] - metrics_a["fde_m"]
-    d_step = metrics_b["mean_step_xy_m"] - metrics_a["mean_step_xy_m"]
-    print("--- delta (guided - baseline) ---")
-    print(f"ΔminADE={d_ade:+.4f} m  ΔFDE={d_fde:+.4f} m  Δmean_xy_step={d_step:+.4f} m")
     coc_match = str(extra_a["cot"]) == str(extra_b["cot"])
-    if not coc_match:
-        print(
-            "Note: CoC strings differ between arms; use --deterministic for stricter repeatability."
-        )
+    shift_l2 = trajectory_shift_l2(pred_a, pred_b)
+    _print_pair_metrics_table(
+        pair_label=pair_label,
+        guidance_schedule=guidance_schedule,
+        guidance_scale=guidance_scale,
+        metrics_a=metrics_a,
+        metrics_b=metrics_b,
+        shift_l2=shift_l2,
+        coc_match=coc_match,
+        coc_preview=extra_a["cot"][0],
+    )
 
     merged_notes = _format_notes(
         notes, pair_id=pair_id, sweep_id=sweep_id, sweep_mode=sweep_mode
     )
     ts = datetime.now(timezone.utc).isoformat()
-    # RMS XYZ distance guided vs baseline for *this* pair (stored on guided RunRecord only).
-    shift_l2 = trajectory_shift_l2(pred_a, pred_b)
 
     if log_results:
         base_rec = RunRecord(
@@ -307,6 +405,12 @@ def _run_baseline_guided_pair(
             mean_xy_step_length=metrics_a["mean_step_xy_m"],
             mean_norm_accel_from_pred_traj=metrics_a["mean_norm_accel_from_pred_traj"],
             mean_norm_kappa_from_pred_traj=metrics_a["mean_norm_kappa_from_pred_traj"],
+            mean_speed_mps=metrics_a["mean_speed_mps"],
+            min_speed_mps=metrics_a["min_speed_mps"],
+            max_abs_lateral_disp_m=metrics_a["max_abs_lateral_disp_m"],
+            heading_change_sum_abs_rad=metrics_a["heading_change_sum_abs_rad"],
+            min_clearance_obstacle_m=metrics_a["min_clearance_obstacle_m"],
+            time_to_stop_s=metrics_a["time_to_stop_s"],
             notes=merged_notes,
         )
         guided_rec = RunRecord(
@@ -327,6 +431,12 @@ def _run_baseline_guided_pair(
             mean_xy_step_length=metrics_b["mean_step_xy_m"],
             mean_norm_accel_from_pred_traj=metrics_b["mean_norm_accel_from_pred_traj"],
             mean_norm_kappa_from_pred_traj=metrics_b["mean_norm_kappa_from_pred_traj"],
+            mean_speed_mps=metrics_b["mean_speed_mps"],
+            min_speed_mps=metrics_b["min_speed_mps"],
+            max_abs_lateral_disp_m=metrics_b["max_abs_lateral_disp_m"],
+            heading_change_sum_abs_rad=metrics_b["heading_change_sum_abs_rad"],
+            min_clearance_obstacle_m=metrics_b["min_clearance_obstacle_m"],
+            time_to_stop_s=metrics_b["time_to_stop_s"],
             notes=merged_notes,
         )
         save_run_record(base_rec, results_dir=results_dir, csv_name=csv_name)
@@ -433,6 +543,20 @@ def main() -> None:
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--csv-name", type=str, default="guidance_runs_v1.csv")
     parser.add_argument("--notes", type=str, default="", help="Optional free-text notes stored in each record.")
+    parser.add_argument(
+        "--trajectory-dt",
+        type=float,
+        default=0.1,
+        help="Seconds between consecutive predicted future waypoints (Physical AI default 0.1 s).",
+    )
+    parser.add_argument(
+        "--obstacle-xy",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("X", "Y"),
+        help="Optional ego-frame point obstacle (meters) for min-clearance; omit to log null/NaN.",
+    )
     args = parser.parse_args()
 
     if args.lambda_sweep is not None and args.schedule_sweep:
@@ -472,6 +596,10 @@ def main() -> None:
 
     clf = HeuristicBehaviorClassifier().to("cuda")
 
+    obstacle_np: np.ndarray | None = (
+        np.array(args.obstacle_xy, dtype=np.float64) if args.obstacle_xy is not None else None
+    )
+
     sweep_id: str | None = None
     sweep_mode: str | None = None
     summaries: list[PairSummary] = []
@@ -501,6 +629,8 @@ def main() -> None:
                 deterministic=args.deterministic,
                 clip_id=args.clip_id,
                 seed=args.seed,
+                traj_dt=args.trajectory_dt,
+                obstacle_xy=obstacle_np,
             )
             summaries.append(summ)
         _print_sweep_table(summaries)
@@ -529,6 +659,8 @@ def main() -> None:
                 deterministic=args.deterministic,
                 clip_id=args.clip_id,
                 seed=args.seed,
+                traj_dt=args.trajectory_dt,
+                obstacle_xy=obstacle_np,
             )
             summaries.append(summ)
         _print_sweep_table(summaries)
@@ -554,6 +686,8 @@ def main() -> None:
             deterministic=args.deterministic,
             clip_id=args.clip_id,
             seed=args.seed,
+            traj_dt=args.trajectory_dt,
+            obstacle_xy=obstacle_np,
         )
 
     if args.log_results:

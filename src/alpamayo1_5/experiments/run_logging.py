@@ -43,6 +43,10 @@ class RunRecord:
     ``trajectory_shift_l2``: on guided rows, RMS L2 distance between that guided trajectory
     and the **baseline** trajectory from the **same** baseline+guided pair (``None`` on
     baseline rows).
+
+    Behavior-oriented summaries (``mean_speed_mps``, ``min_speed_mps``, etc.) are computed
+    from the **predicted XY polyline** in the ego frame with fixed ``trajectory_dt``; when no
+    ``--obstacle-xy`` is supplied, ``min_clearance_obstacle_m`` is NaN (JSON ``null`` / empty CSV).
     """
 
     run_id: str
@@ -62,6 +66,12 @@ class RunRecord:
     mean_xy_step_length: float
     mean_norm_accel_from_pred_traj: float
     mean_norm_kappa_from_pred_traj: float
+    mean_speed_mps: float
+    min_speed_mps: float
+    max_abs_lateral_disp_m: float
+    heading_change_sum_abs_rad: float
+    min_clearance_obstacle_m: float
+    time_to_stop_s: float
     notes: str = ""
 
     def to_csv_row(self) -> dict[str, Any]:
@@ -97,6 +107,12 @@ CSV_COLUMNS: list[str] = [
     "mean_xy_step_length",
     "mean_norm_accel_from_pred_traj",
     "mean_norm_kappa_from_pred_traj",
+    "mean_speed_mps",
+    "min_speed_mps",
+    "max_abs_lateral_disp_m",
+    "heading_change_sum_abs_rad",
+    "min_clearance_obstacle_m",
+    "time_to_stop_s",
     "notes",
 ]
 

@@ -1,0 +1,23 @@
+{
+  "clip_id": "030c760c-ae38-49aa-9ad8-f5650a545d26",
+  "seed": 42,
+  "guidance_scale": 0.15,
+  "guidance_schedule": "all",
+  "coc_matched_baseline": true,
+  "pair_id": "20260422T010225_ff2cff02a5",
+  "sweep_id": "20260422T010220_96122b7c4c",
+  "sweep_mode": "lambda_sweep",
+  "pair_label": "\u03bb=0.15",
+  "timestamp_iso": "2026-04-22T01:02:30.419604+00:00",
+  "min_ade_baseline": 0.3729530870914459,
+  "min_ade_guided": 0.35854372382164,
+  "fde_baseline": 2.1923060417175293,
+  "fde_guided": 2.1299471855163574,
+  "trajectory_shift_l2": 0.027090633288025856,
+  "arrays": {
+    "gt_xy": "(T,2)",
+    "baseline_xy": "(T,2)",
+    "guided_xy": "(T,2)",
+    "T": 64
+  }
+}

@@ -27,6 +27,12 @@ def test_save_run_record_csv_and_json(tmp_path: Path) -> None:
         mean_xy_step_length=0.5,
         mean_norm_accel_from_pred_traj=0.0,
         mean_norm_kappa_from_pred_traj=0.0,
+        mean_speed_mps=1.0,
+        min_speed_mps=0.5,
+        max_abs_lateral_disp_m=0.0,
+        heading_change_sum_abs_rad=0.1,
+        min_clearance_obstacle_m=float("nan"),
+        time_to_stop_s=float("nan"),
         notes="unit",
     )
     json_path = save_run_record(rec, results_dir=tmp_path)
