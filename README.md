@@ -147,13 +147,13 @@ ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py \
 
 These are **lightweight kinematic summaries** on the **predicted XY** horizon (and rotation for heading change), **not** a substitute for scenario-specific safety or intent evaluation. They help compare baseline vs guided **trajectory shape** in the same ego frame as the model.
 
-| CSV / JSON field | Meaning (short) |
-| ---------------- | ---------------- |
-| **`mean_speed_mps`**, **`min_speed_mps`** | Mean / min segment speed from consecutive XY waypoints, using **`--trajectory-dt`**. |
-| **`max_abs_lateral_disp_m`** | Max absolute lateral offset from the initial motion direction (through the first waypoint). |
-| **`heading_change_sum_abs_rad`** | Sum of absolute wrapped yaw steps along the horizon (from **`pred_rot`** when available). |
-| **`min_clearance_obstacle_m`** | Min distance from any predicted XY point to **`--obstacle-xy`**; **null/empty** if no obstacle was passed. |
-| **`time_to_stop_s`** | First time (s) at the end of a segment whose speed falls below **0.2 m/s** (never → null/empty). |
+| CSV / JSON field                          | Meaning (short)                                                                                            |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **`mean_speed_mps`**, **`min_speed_mps`** | Mean / min segment speed from consecutive XY waypoints, using **`--trajectory-dt`**.                       |
+| **`max_abs_lateral_disp_m`**              | Max absolute lateral offset from the initial motion direction (through the first waypoint).                |
+| **`heading_change_sum_abs_rad`**          | Sum of absolute wrapped yaw steps along the horizon (from **`pred_rot`** when available).                  |
+| **`min_clearance_obstacle_m`**            | Min distance from any predicted XY point to **`--obstacle-xy`**; **null/empty** if no obstacle was passed. |
+| **`time_to_stop_s`**                      | First time (s) at the end of a segment whose speed falls below **0.2 m/s** (never → null/empty).           |
 
 Sweeps log **one baseline row per pair** on purpose: each pair re-seeds and runs a full baseline rollout before its guided rollout, so repeated baselines are independent rerolls, not duplicate logging.
 
@@ -181,17 +181,17 @@ Our extension sits strictly in step (3), optionally modifying **`v`** after the 
 
 ### What we implemented in this repo
 
-| Piece | Role |
-| ----- | ---- |
-| **`FlowMatching` / `_euler`** (`diffusion/flow_matching.py`) | Optional **`denoising_guidance_fn(x, t, v, step_index) → delta_v`** applied **after** the expert **`step_fn`** and **before** **`x += dt·v`**. |
-| **`alpamayo1_5/steering/`** | **`HeuristicBehaviorClassifier`**: differentiable **3-class** logits from **pooled (mean accel, mean curvature)** vs fixed prototypes — a **stand-in** for a learned **\(C(x,t)\)**. **`classifier_gradient_guidance_fn`** wraps it as a **`denoising_guidance_fn`**. **`wrap_guidance_schedule`** implements **`all`**, **`early`** (first ~40% of Euler steps), **`late`** (last ~40%). |
-| **`compare_denoising_guidance.py`** | Main **experiment runner**: baseline vs guided, **`--lambda-sweep`**, **`--schedule-sweep`**, **`--log-results`**, **`--save-artifacts`**, prints trajectory metrics and deltas. |
-| **`experiments/run_logging.py`** | **`RunRecord`** + **`save_run_record`**: append CSV under **`results/csv/`**, one JSON file per arm under **`results/json/`**. |
-| **`metrics/`** | **`trajectory_metrics.py`**: minADE/FDE, XY step length, guided–baseline **trajectory shift (RMS L2 in XYZ)**, traj-derived normalized accel/κ. **`behavior_metrics.py`**: mean/min speed, max lateral offset, heading-change sum, optional obstacle clearance, time-to-stop—used by **`compare_denoising_guidance.py`** for print + CSV/JSON. |
-| **Artifacts** | With **`--save-artifacts`**: **`results/artifacts/pair_<pair_id>.npz`** (`gt_xy`, `baseline_xy`, `guided_xy`) and **`pair_<pair_id>_meta.json`** (clip id, λ, schedule, CoC match flag, scalar metrics). |
-| **`scripts/plot_guidance_trajectories.py`** | **Matplotlib-only** 3-panel XY figure; default output **`results/figures/pair_<pair_id>.png`** (overridable with **`--output`**); **`--aspect-mode`** **`readable`** (default) or **`equal`**. |
-| **`tests/`** | **`test_denoising_guidance`**, **`test_wrap_guidance_schedule`**, **`test_trajectory_metrics`**, **`test_behavior_metrics`**, **`test_run_logging`** — lightweight checks on the hook, schedules, metrics, and logging. |
-| **`test_inference.py`** | Optional **`ALPAMAYO_DEBUG`** logging for the expert + Euler loop (see script docstring). |
+| Piece                                                        | Role                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`FlowMatching` / `_euler`** (`diffusion/flow_matching.py`) | Optional **`denoising_guidance_fn(x, t, v, step_index) → delta_v`** applied **after** the expert **`step_fn`** and **before** **`x += dt·v`**.                                                                                                                                                                                                                                            |
+| **`alpamayo1_5/steering/`**                                  | **`HeuristicBehaviorClassifier`**: differentiable **3-class** logits from **pooled (mean accel, mean curvature)** vs fixed prototypes — a **stand-in** for a learned **\(C(x,t)\)**. **`classifier_gradient_guidance_fn`** wraps it as a **`denoising_guidance_fn`**. **`wrap_guidance_schedule`** implements **`all`**, **`early`** (first ~40% of Euler steps), **`late`** (last ~40%). |
+| **`compare_denoising_guidance.py`**                          | Main **experiment runner**: baseline vs guided, **`--lambda-sweep`**, **`--schedule-sweep`**, **`--log-results`**, **`--save-artifacts`**, prints trajectory metrics and deltas.                                                                                                                                                                                                          |
+| **`experiments/run_logging.py`**                             | **`RunRecord`** + **`save_run_record`**: append CSV under **`results/csv/`**, one JSON file per arm under **`results/json/`**.                                                                                                                                                                                                                                                            |
+| **`metrics/`**                                               | **`trajectory_metrics.py`**: minADE/FDE, XY step length, guided–baseline **trajectory shift (RMS L2 in XYZ)**, traj-derived normalized accel/κ. **`behavior_metrics.py`**: mean/min speed, max lateral offset, heading-change sum, optional obstacle clearance, time-to-stop—used by **`compare_denoising_guidance.py`** for print + CSV/JSON.                                            |
+| **Artifacts**                                                | With **`--save-artifacts`**: **`results/artifacts/pair_<pair_id>.npz`** (`gt_xy`, `baseline_xy`, `guided_xy`) and **`pair_<pair_id>_meta.json`** (clip id, λ, schedule, CoC match flag, scalar metrics).                                                                                                                                                                                  |
+| **`scripts/plot_guidance_trajectories.py`**                  | **Matplotlib-only** 3-panel XY figure; default output **`results/figures/pair_<pair_id>.png`** (overridable with **`--output`**); **`--aspect-mode`** **`readable`** (default) or **`equal`**.                                                                                                                                                                                            |
+| **`tests/`**                                                 | **`test_denoising_guidance`**, **`test_wrap_guidance_schedule`**, **`test_trajectory_metrics`**, **`test_behavior_metrics`**, **`test_run_logging`** — lightweight checks on the hook, schedules, metrics, and logging.                                                                                                                                                                   |
+| **`test_inference.py`**                                      | Optional **`ALPAMAYO_DEBUG`** logging for the expert + Euler loop (see script docstring).                                                                                                                                                                                                                                                                                                 |
 
 **Important:** the shipped **`HeuristicBehaviorClassifier`** is for **pipeline debugging and coarse controllability experiments**, not a substitute for a **dataset-trained, noise-conditioned `C(x, t)`** as in the full research plan.
 
@@ -214,6 +214,31 @@ This fork is a **working prototype and experiment harness**: it validates that *
 1. **Train `C(x, t)`** on Physical AI AV with noisy actions from the **forward** flow and **behavior labels** aligned to CoC vocabulary.
 2. **Sweep `λ`** and optional **time schedules** (early vs late denoising); measure **behavioral hit rate** vs **minADE/minFDE** tradeoffs (evaluation protocol in the midterm).
 3. **Scale** to scenario strata (nominal vs long-tail) and compare against **reasoning-level** interventions.
+
+### Labeling clips (step 1 of the roadmap)
+
+Step 1 assigns each Physical AI clip a **weak behavior class** from its ground-truth future polyline. Five classes: **`yield`**, **`cruise`**, **`accelerate`**, **`turn_left`**, **`turn_right`** (`src/alpamayo1_5/labels/kinematic_labels.py`). Ambiguous samples (e.g. "accelerate into a turn") are dropped. Training a noise-conditioned classifier on this labeled set is out of scope for this iteration.
+
+```bash
+# Inspect one clip end-to-end (kinematic summary + weak label + heuristic probs)
+python scripts/one_off_label_clip.py \
+    --clip-id 030c760c-ae38-49aa-9ad8-f5650a545d26
+
+# Stream all clips, label them, cache normalized actions (needs HF gated access + model config)
+python scripts/build_labeled_cache.py \
+    --clip-ids notebooks/clip_ids.parquet \
+    --n-t0-per-clip 5 \
+    --out results/labels/cache_v1.pt \
+    --resume
+```
+
+The cache writes `results/labels/cache_v1.pt` (actions + labels + clip IDs + normalization constants) and `results/labels/cache_v1.stats.json` (per-class counts). Inspect with:
+
+```python
+import torch, collections
+c = torch.load("results/labels/cache_v1.pt", weights_only=False)
+print(collections.Counter(c["labels"].tolist()))
+```
 
 ## Project Structure
 
@@ -301,8 +326,8 @@ uv sync --active
 <details>
 <summary><strong>How does Alpamayo 1.5 relate to Alpamayo 1?</strong></summary>
 
-Alpamayo 1.5 expands upon the architecture released in Alpamayo 1 and fully realizes what is described in our paper [*"Alpamayo 1: Bridging Reasoning and Action Prediction for Generalizable Autonomous Driving in the Long Tail
-"*](https://arxiv.org/abs/2511.00088). Specifically:
+Alpamayo 1.5 expands upon the architecture released in Alpamayo 1 and fully realizes what is described in our paper [_"Alpamayo 1: Bridging Reasoning and Action Prediction for Generalizable Autonomous Driving in the Long Tail
+"_](https://arxiv.org/abs/2511.00088). Specifically:
 
 | Feature                                 | Description                                                      | Alpamayo 1             | Alpamayo 1.5       |
 | --------------------------------------- | ---------------------------------------------------------------- | ---------------------- | ------------------ |

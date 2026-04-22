@@ -204,6 +204,11 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Labeled caches produced by scripts/build_labeled_cache.py — regenerate
+# from the scripts rather than committing multi-MB .pt files.
+results/labels/
+*.pt.tmp
+
 # PyPI configuration file
 .pypirc
 
