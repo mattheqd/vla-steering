@@ -14,10 +14,14 @@ level t. See Section 5 of the project report.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 from torch import nn
+
+ScheduleName = Literal["all", "early", "late"]
 
 
 class HeuristicBehaviorClassifier(nn.Module):
@@ -83,3 +87,44 @@ def classifier_gradient_guidance_fn(
         return (scale * grad).to(device=v.device, dtype=v.dtype)
 
     return denoising_guidance_fn
+
+
+def wrap_guidance_schedule(
+    inner: Callable[..., torch.Tensor],
+    *,
+    schedule: ScheduleName | str,
+    num_inference_steps: int,
+) -> Callable[..., torch.Tensor]:
+    """Mask ``inner`` so guidance applies only on a subset of Euler steps.
+
+    * ``all``: same as ``inner`` (every step, indices ``0 .. num_inference_steps-1``).
+    * ``early``: first 40% of steps only, i.e. ``step_index < ceil(0.4 * N)``.
+    * ``late``: last 40% of steps only, i.e. ``step_index >= floor(0.6 * N)``.
+
+    Here ``N == num_inference_steps`` (the number of Euler updates, not including t=1).
+    """
+    s = str(schedule).lower()
+    if s == "all":
+        return inner
+    if s not in ("early", "late"):
+        raise ValueError(f"schedule must be all|early|late, got {schedule!r}")
+    n = int(num_inference_steps)
+    if n <= 0:
+        raise ValueError(f"num_inference_steps must be positive, got {n}")
+    early_apply_until = max(0, math.ceil(0.4 * n))
+    late_apply_from = min(n, math.floor(0.6 * n))
+
+    def wrapped(
+        *,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        v: torch.Tensor,
+        step_index: int,
+    ) -> torch.Tensor:
+        if s == "early" and step_index >= early_apply_until:
+            return torch.zeros_like(v)
+        if s == "late" and step_index < late_apply_from:
+            return torch.zeros_like(v)
+        return inner(x=x, t=t, v=v, step_index=step_index)
+
+    return wrapped

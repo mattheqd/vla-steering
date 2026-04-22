@@ -1,0 +1,20 @@
+{
+  "run_id": "20260422T005055_3c73fbbe0f",
+  "timestamp_iso": "2026-04-22T00:50:55.709491+00:00",
+  "arm": "guided",
+  "clip_id": "030c760c-ae38-49aa-9ad8-f5650a545d26",
+  "seed": 42,
+  "guidance_scale": 0.8,
+  "target_class": 0,
+  "guidance_schedule": "all",
+  "deterministic": false,
+  "coc_text": "[[['Nudge to the left to clear the construction equipment blocking the right side of our lane']]]",
+  "coc_matched_baseline": true,
+  "min_ade": 0.3068143427371979,
+  "fde": 1.8832340240478516,
+  "trajectory_shift_l2": 0.13344420492649078,
+  "mean_xy_step_length": 0.7701391577720642,
+  "mean_norm_accel_from_pred_traj": -0.215168297290802,
+  "mean_norm_kappa_from_pred_traj": 0.008655646815896034,
+  "notes": "pair_id=20260422T005050_b30e328efb"
+}

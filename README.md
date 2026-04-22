@@ -12,7 +12,7 @@
 **📖 Please read the [HuggingFace Model Card](https://huggingface.co/nvidia/Alpamayo-1.5-10B) first!**
 The model card contains comprehensive details on model architecture, inputs/outputs, licensing, and tested hardware configurations. This GitHub README focuses on setup, usage, and frequently asked questions.
 
-**Research fork (USC):** this checkout extends the upstream Alpamayo 1.5 codebase with **inference-time steering in trajectory space** via **denoising-time classifier guidance** on the flow-matching expert. See [Research extension: denoising-time trajectory steering](#research-extension-denoising-time-trajectory-steering-usc) for motivation, design, and how to reproduce experiments.
+**Research fork (USC):** this checkout extends the upstream Alpamayo 1.5 codebase with **inference-time steering in trajectory space** via **optional denoising-time classifier guidance** in the flow-matching expert’s Euler loop, plus a small **experiment harness** (A/B runner, λ/schedule sweeps, CSV/JSON logging, optional trajectory artifacts, and a plotting script). See [Research extension: denoising-time trajectory steering](#research-extension-denoising-time-trajectory-steering-usc) for motivation, design, and how to reproduce experiments.
 
 ## Prerequisites
 
@@ -110,7 +110,7 @@ pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout
 )
 ```
 
-**A/B script** (baseline vs guided on one Physical AI clip, same RNG reset per run):
+**Experiment runner** (`compare_denoising_guidance.py`): baseline vs guided on one Physical AI clip, **same RNG reset** before each full `sample_trajectories_from_data_with_vlm_rollout`. Optional **`--log-results`** appends structured rows to CSV and per-arm JSON; optional **`--save-artifacts`** writes compact **`results/artifacts/pair_<pair_id>.npz`** (XY polylines) and **`pair_<pair_id>_meta.json`** for plotting.
 
 ```bash
 # Quieter logs
@@ -118,9 +118,30 @@ ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py
 
 # Stronger intervention (tune carefully)
 ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py --guidance-scale 0.5 --target-class 0
+
+# Single pair: guided run with logging (example hyperparameters)
+ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py \
+  --guidance-scale 0.3 --guidance-schedule all --target-class 0 --log-results
+
+# Same, plus trajectory artifacts for qualitative figures
+ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py \
+  --guidance-scale 0.3 --guidance-schedule all --target-class 0 --log-results --save-artifacts
+
+# λ sweep (shared sweep_id in notes); guided schedule fixed by --guidance-schedule
+ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py \
+  --lambda-sweep 0.0 0.15 0.3 0.8 --guidance-schedule all --target-class 0 --log-results
+
+# Schedule sweep at fixed λ (runs all / early / late vs baseline each pair)
+ALPAMAYO_DEBUG=0 python src/alpamayo1_5/compare_denoising_guidance.py \
+  --schedule-sweep --guidance-scale 0.3 --target-class 0 --log-results
+
+# Plot a saved artifact (default aspect mode is “readable”; use --aspect-mode equal for 1:1 axes)
+python scripts/plot_guidance_trajectories.py --npz results/artifacts/pair_<pair_id>.npz
 ```
 
-`--target-class` indexes the heuristic prototype: **0** ≈ yield-ish (negative mean accel), **1** neutral, **2** accel-ish. **`--deterministic`** enables stricter cuDNN settings when you need more reproducible A/Bs.
+Sweeps log **one baseline row per pair** on purpose: each pair re-seeds and runs a full baseline rollout before its guided rollout, so repeated baselines are independent rerolls, not duplicate logging.
+
+`--target-class` is the guided classifier label **y** (**0** ≈ yield-ish, **1** neutral, **2** accel-ish); the same value is stored on baseline rows as the **paired** experiment target (not inferred from the baseline run). Logged **`guidance_schedule`** is **`none`** for baseline. Guided arms use **`--guidance-schedule`**: **`all`** (λ every Euler step), **`early`** (first 40% of steps), **`late`** (last 40%). **`--deterministic`** enables stricter cuDNN settings when you need more reproducible A/Bs.
 
 ## Research extension: denoising-time trajectory steering (USC)
 
@@ -146,22 +167,31 @@ Our extension sits strictly in step (3), optionally modifying **`v`** after the 
 
 | Piece | Role |
 | ----- | ---- |
-| **`FlowMatching.sample` / `_euler`** | Optional **`denoising_guidance_fn`**; gradient-based **`delta_v`** is added to **`v`** each step. |
-| **`alpamayo1_5/steering/`** | **`HeuristicBehaviorClassifier`**: differentiable **3-class** logits from **pooled (mean accel, mean curvature)** vs fixed prototypes (stand-in until **\(C\)** is trained on Physical AI). **`classifier_gradient_guidance_fn`** wraps it as a **`denoising_guidance_fn`**. |
-| **`compare_denoising_guidance.py`** | Loads the default example clip, runs **baseline** then **guided** with **`torch.cuda.manual_seed_all`** (and friends) reset to the same seed before each full **`sample_trajectories_from_data_with_vlm_rollout`**, prints **minADE**, **FDE**, mean XY step length, and deltas. |
+| **`FlowMatching` / `_euler`** (`diffusion/flow_matching.py`) | Optional **`denoising_guidance_fn(x, t, v, step_index) → delta_v`** applied **after** the expert **`step_fn`** and **before** **`x += dt·v`**. |
+| **`alpamayo1_5/steering/`** | **`HeuristicBehaviorClassifier`**: differentiable **3-class** logits from **pooled (mean accel, mean curvature)** vs fixed prototypes — a **stand-in** for a learned **\(C(x,t)\)**. **`classifier_gradient_guidance_fn`** wraps it as a **`denoising_guidance_fn`**. **`wrap_guidance_schedule`** implements **`all`**, **`early`** (first ~40% of Euler steps), **`late`** (last ~40%). |
+| **`compare_denoising_guidance.py`** | Main **experiment runner**: baseline vs guided, **`--lambda-sweep`**, **`--schedule-sweep`**, **`--log-results`**, **`--save-artifacts`**, prints trajectory metrics and deltas. |
+| **`experiments/run_logging.py`** | **`RunRecord`** + **`save_run_record`**: append CSV under **`results/csv/`**, one JSON file per arm under **`results/json/`**. |
+| **`metrics/`** | **minADE/FDE**, XY step length, guided–baseline **trajectory shift (RMS L2 in XYZ)**, and traj-derived normalized accel/κ summaries used in logged tables. |
+| **Artifacts** | With **`--save-artifacts`**: **`results/artifacts/pair_<pair_id>.npz`** (`gt_xy`, `baseline_xy`, `guided_xy`) and **`pair_<pair_id>_meta.json`** (clip id, λ, schedule, CoC match flag, scalar metrics). |
+| **`scripts/plot_guidance_trajectories.py`** | **Matplotlib-only** 3-panel XY figure; default output **`results/figures/pair_<pair_id>.png`** (overridable with **`--output`**); **`--aspect-mode`** **`readable`** (default) or **`equal`**. |
+| **`tests/`** | **`test_denoising_guidance`**, **`test_wrap_guidance_schedule`**, **`test_trajectory_metrics`**, **`test_run_logging`** — lightweight checks on the hook, schedules, metrics, and logging. |
 | **`test_inference.py`** | Optional **`ALPAMAYO_DEBUG`** logging for the expert + Euler loop (see script docstring). |
-| **`tests/test_denoising_guidance.py`** | Unit tests for the guidance hook and tensor shapes. |
 
-**Important:** the shipped **`HeuristicBehaviorClassifier`** is for **pipeline debugging and coarse steering experiments**, not a substitute for a **dataset-trained, noise-conditioned `C(x, t)`** as in the full research plan.
+**Important:** the shipped **`HeuristicBehaviorClassifier`** is for **pipeline debugging and coarse controllability experiments**, not a substitute for a **dataset-trained, noise-conditioned `C(x, t)`** as in the full research plan.
 
-### Preliminary observations (single-clip sanity checks)
+### Preliminary results (single-clip prototype)
 
-On the default Physical AI example clip, with **identical CoC** between A/B and matched noise at the first Euler step:
+This fork is a **working prototype and experiment harness**: it validates that **denoising-time guidance can steer the expert’s trajectory samples** while keeping the **VLM rollout API unchanged**, and it supports the next stage (training **\(C\)** and broader evaluation). **Do not** read the bullets below as claims about **general driving quality** or **behavioral alignment** beyond the logged geometric summaries.
 
-- A modest **`scale`** (e.g. **0.15**, **`target_class=0`**) produced small **improvements** in **minADE / FDE** vs ground truth in our script’s metrics.
-- A larger **`scale`** (e.g. **0.5**) increased the **magnitude of `v`** corrections and produced **larger** **ΔminADE / ΔFDE** on that clip.
+**Representative figure (example path):** after running with **`--save-artifacts`** and the plotting script, inspect e.g. **`results/figures/pair_<pair_id>.png`** (exact stem matches the artifact **`pair_id`**).
 
-These results **do not** generalize beyond the tested scenario; they only validate that the **hook is live** and **λ scales the intervention** as expected.
+**Controlled A/B (default Physical AI example clip):** when **baseline and guided CoC strings match** (use **`--deterministic`** if you need stricter repeatability), **denoising-time guidance can change the predicted trajectory** while leaving the **paired CoC text** unchanged for that run configuration.
+
+**λ sweep (`--guidance-schedule all`, default clip, logged `trajectory_shift_l2` vs baseline):** **`λ = 0.0`** behaves as a **no-op** on the guided arm; **larger λ** tends to increase **trajectory shift magnitude** in our runs. **Example** values observed on the **default clip** (your CSV may differ slightly if RNG or weights differ): **`λ ≈ 0.15`** → **`trajectory_shift_l2 ≈ 0.027` m** with a **small change in logged geometric metrics** (minADE/FDE vs ground truth); **`λ ≈ 0.30`** → **`≈ 0.047` m** with a **larger change** in those summaries; **`λ ≈ 0.80`** → **`≈ 0.133` m** with **stronger** movement in the same summaries. On the tested clip, guided runs at higher λ also tended toward **lower minADE/FDE vs ground truth** in the logged table, but **minADE/FDE** are **polyline error vs dataset future** in the runner — they are **not** behavioral alignment scores.
+
+**Schedule sweep (default clip, `λ = 0.3`):** **`all`** produced the **largest** guided-vs-baseline **`trajectory_shift_l2`** in our logs; **`early`** and **`late`** were **weaker and similar**, with **`late` slightly larger than `early` on this clip**.
+
+**Limitations:** findings are **single-clip** (unless you expand runs); the classifier is **heuristic**, not the target trained **\(C(x,t)\)**; **ADE/FDE** do not certify **safe or desirable** driving; sweeps **re-roll baseline per pair**, so repeated baseline rows are **intentional**, not duplicate logging.
 
 ### Next steps (research roadmap)
 
@@ -178,26 +208,40 @@ alpamayo1.5/
 │   ├── inference_cam_num.ipynb          # Inference with different camera counts
 │   ├── inference_nav.ipynb              # Inference with navigation guidance
 │   └── inference_vqa.ipynb              # Visual question answering
+├── scripts/
+│   └── plot_guidance_trajectories.py    # Qualitative 3-panel XY plots from saved artifacts
+├── results/                             # Experiment outputs from local runs; subtrees may use .gitkeep
+│   ├── csv/                             # Appended experiment tables (e.g. guidance_runs_v1.csv)
+│   ├── json/                            # One JSON per logged arm
+│   ├── artifacts/                       # Optional per-pair .npz + _meta.json (--save-artifacts)
+│   └── figures/                         # e.g. pair_<pair_id>.png from the plotting script
 ├── src/
 │   └── alpamayo1_5/
 │       ├── action_space/
 │       │   └── ...                      # Action space definitions (unicycle accel/curvature)
 │       ├── diffusion/
 │       │   └── flow_matching.py         # Euler flow matching (+ optional denoising guidance)
+│       ├── experiments/
+│       │   └── run_logging.py           # RunRecord + CSV/JSON logging helpers
 │       ├── geometry/
 │       │   └── ...                      # Geometry utilities and modules
+│       ├── metrics/
+│       │   └── ...                      # Trajectory metrics used by the compare runner
 │       ├── models/
 │       │   └── ...                      # Alpamayo1_5, VLM + expert, rollout API
 │       ├── steering/
-│       │   └── denoising_guidance.py    # Heuristic classifier + gradient guidance factory
+│       │   └── denoising_guidance.py    # Heuristic classifier + schedule + gradient guidance factory
 │       ├── __init__.py                  # Package marker
-│       ├── compare_denoising_guidance.py # A/B: baseline vs guided trajectory sampling
+│       ├── compare_denoising_guidance.py # A/B runner: baseline vs guided (+ sweeps, logging, artifacts)
 │       ├── config.py                    # Model and experiment configuration
 │       ├── helper.py                    # Utility functions
 │       ├── load_physical_aiavdataset.py # Dataset loader
 │       └── test_inference.py            # End-to-end inference smoke test
 ├── tests/
-│   └── test_denoising_guidance.py       # Unit tests for guidance hook
+│   ├── test_denoising_guidance.py       # Guidance hook / wiring
+│   ├── test_wrap_guidance_schedule.py   # Schedule masking on the Euler index
+│   ├── test_trajectory_metrics.py       # Metric helpers
+│   └── test_run_logging.py              # RunRecord + CSV/JSON serialization
 ├── pyproject.toml                       # Project dependencies
 └── uv.lock                              # Locked dependency versions
 ```
