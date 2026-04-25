@@ -8,9 +8,11 @@ from alpamayo1_5.steering.denoising_guidance import (
     classifier_gradient_guidance_fn,
     wrap_guidance_schedule,
 )
+from alpamayo1_5.steering.trained_classifier import TrainedBehaviorClassifier
 
 __all__ = [
     "HeuristicBehaviorClassifier",
+    "TrainedBehaviorClassifier",
     "classifier_gradient_guidance_fn",
     "wrap_guidance_schedule",
 ]
