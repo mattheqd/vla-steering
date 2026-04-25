@@ -1,0 +1,10 @@
+{
+  "num_rows": 4739,
+  "per_class_counts": {
+    "yield": 2109,
+    "cruise": 1494,
+    "accelerate": 896,
+    "turn_left": 122,
+    "turn_right": 118
+  }
+}

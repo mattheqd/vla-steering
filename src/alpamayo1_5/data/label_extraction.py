@@ -3,9 +3,12 @@
 
 """Build and load the ``(action_x1, label)`` cache of weakly-labelled clips.
 
-We iterate clip IDs, sample a grid of ``t0_us`` per clip, load the
-ego-future polyline, bucket it into a kinematic behavior class, and store
-the **normalized** action tensor ``x1 = traj_to_action(...)`` alongside.
+We iterate clip IDs, fetch the clip's **egomotion feature** directly (single
+HuggingFace download per clip — camera frames are **not** touched, which
+makes this ~5× faster than going through ``load_physical_aiavdataset``),
+sample a grid of ``t0_us`` inside the clip's valid window, bucket each
+future polyline into a kinematic behavior class, and store the normalized
+action tensor ``x1 = traj_to_action(...)`` alongside.
 
 The cache is self-contained — normalization constants are included so that
 downstream consumers (visualization, analysis, or a future training step)
@@ -18,9 +21,10 @@ import json
 import logging
 from collections import Counter
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
+import scipy.spatial.transform as spt
 import torch
 
 from alpamayo1_5.action_space.action_space import ActionSpace
@@ -36,43 +40,99 @@ _TIME_STEP = 0.1
 _STEP_US = int(_TIME_STEP * 1_000_000)
 
 
-def _estimate_clip_duration_us(loader_probe: Callable[..., dict[str, Any]], clip_id: str) -> int | None:
-    """Infer clip length (µs) by probing a small t0 and reading timestamp metadata.
-
-    Falls back to ``None`` if the probe itself fails (clip unavailable,
-    network error, etc.). The caller skips such clips.
-    """
-    t0 = _NUM_HISTORY_STEPS * _STEP_US + _STEP_US  # first valid t0
-    try:
-        data = loader_probe(clip_id=clip_id, t0_us=t0)
-    except Exception as e:  # pragma: no cover — network/streaming-dependent
-        logger.warning("probe failed for clip %s: %s", clip_id, e)
-        return None
-    ts = data.get("absolute_timestamps")
-    if ts is None:
-        return None
-    return int(ts.max().item())
-
-
-def _extract_action_x1(
-    action_space: ActionSpace,
-    data: dict[str, Any],
-) -> torch.Tensor | None:
-    """Run ``traj_to_action`` on a loaded clip dict; return ``(T, 2)`` or ``None``."""
-    try:
-        act = action_space.traj_to_action(
-            data["ego_history_xyz"],
-            data["ego_history_rot"],
-            data["ego_future_xyz"],
-            data["ego_future_rot"],
+def _history_timestamps(t0_us: int) -> np.ndarray:
+    return (
+        t0_us
+        + np.arange(
+            -(_NUM_HISTORY_STEPS - 1) * _STEP_US,
+            _STEP_US // 2,
+            _STEP_US,
+            dtype=np.int64,
         )
-        if isinstance(act, tuple):
-            act = act[0]
-        # act: (1, 1, T, 2)
-        return act.detach().float().cpu().squeeze(0).squeeze(0).contiguous()
-    except Exception as e:  # pragma: no cover — model-config-dependent
-        logger.warning("traj_to_action failed: %s", e)
-        return None
+    )
+
+
+def _future_timestamps(t0_us: int) -> np.ndarray:
+    return (
+        t0_us
+        + np.arange(
+            _STEP_US,
+            int((_NUM_FUTURE_STEPS + 0.5) * _STEP_US),
+            _STEP_US,
+            dtype=np.int64,
+        )
+    )
+
+
+def _poses_to_local_frame(
+    hist_xyz: np.ndarray,
+    hist_quat: np.ndarray,
+    fut_xyz: np.ndarray,
+    fut_quat: np.ndarray,
+) -> dict[str, torch.Tensor]:
+    """Mirror of the local-frame transform in ``load_physical_aiavdataset``.
+
+    All four tensors come back with batch dims ``(1, 1, T, ...)`` so they plug
+    straight into :meth:`ActionSpace.traj_to_action`.
+    """
+    t0_xyz = hist_xyz[-1].copy()
+    t0_quat = hist_quat[-1].copy()
+    t0_rot = spt.Rotation.from_quat(t0_quat)
+    t0_rot_inv = t0_rot.inv()
+
+    hist_xyz_local = t0_rot_inv.apply(hist_xyz - t0_xyz)
+    fut_xyz_local = t0_rot_inv.apply(fut_xyz - t0_xyz)
+    hist_rot_local = (t0_rot_inv * spt.Rotation.from_quat(hist_quat)).as_matrix()
+    fut_rot_local = (t0_rot_inv * spt.Rotation.from_quat(fut_quat)).as_matrix()
+
+    def _t(arr: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(np.asarray(arr)).float().unsqueeze(0).unsqueeze(0)
+
+    return {
+        "ego_history_xyz": _t(hist_xyz_local),
+        "ego_history_rot": _t(hist_rot_local),
+        "ego_future_xyz": _t(fut_xyz_local),
+        "ego_future_rot": _t(fut_rot_local),
+    }
+
+
+def _ego_sample(egomotion, t0_us: int) -> dict[str, torch.Tensor]:
+    """Sample (history, future) poses around ``t0_us`` from an ``Interpolator``."""
+    ego_hist = egomotion(_history_timestamps(t0_us))
+    ego_fut = egomotion(_future_timestamps(t0_us))
+    return _poses_to_local_frame(
+        np.asarray(ego_hist.pose.translation),
+        np.asarray(ego_hist.pose.rotation.as_quat()),
+        np.asarray(ego_fut.pose.translation),
+        np.asarray(ego_fut.pose.rotation.as_quat()),
+    )
+
+
+def _valid_t0_range_us(egomotion) -> tuple[int, int]:
+    """Return ``(lo, hi)`` µs range of valid ``t0`` values for this clip.
+
+    Needs ``num_history_steps`` samples before ``t0`` and ``num_future_steps``
+    samples after, at ``_TIME_STEP`` resolution. Clip timestamps can start
+    slightly negative (per Physical AI convention), so we use the interpolator's
+    actual ``time_range`` rather than assuming zero-based.
+    """
+    lo_raw, hi_raw = egomotion.time_range
+    lo = int(lo_raw) + _NUM_HISTORY_STEPS * _STEP_US + 1
+    hi = int(hi_raw) - _NUM_FUTURE_STEPS * _STEP_US
+    return lo, hi
+
+
+def _evenly_spaced_t0(lo_us: int, hi_us: int, *, n: int, min_gap_s: float) -> list[int]:
+    """Up to ``n`` t0 values in ``[lo_us, hi_us]`` with at least ``min_gap_s`` gap."""
+    if hi_us <= lo_us or n <= 0:
+        return []
+    gap_us = max(1, int(min_gap_s * 1_000_000))
+    max_by_gap = max(1, (hi_us - lo_us) // gap_us + 1)
+    k = min(n, max_by_gap)
+    if k == 1:
+        return [(lo_us + hi_us) // 2]
+    stride = (hi_us - lo_us) // (k - 1)
+    return [int(lo_us + i * stride) for i in range(k)]
 
 
 def build_labeled_cache(
@@ -82,22 +142,23 @@ def build_labeled_cache(
     out_path: str | Path,
     n_t0_per_clip: int = 5,
     min_gap_s: float = 2.0,
-    loader: Callable[..., dict[str, Any]] | None = None,
+    avdi: Any | None = None,
     resume: bool = True,
     max_clips: int | None = None,
-    progress: Callable[[int, int], None] | None = None,
+    progress=None,
 ) -> dict[str, Any]:
     """Stream clips, label them, and append rows to a ``.pt`` cache.
 
     Args:
         clip_ids: Strings to iterate in order.
-        action_space: The model's action space (use the model's own
-            instance to preserve trained normalization constants).
-        out_path: Where to save the ``.pt`` cache (parent dirs created).
+        action_space: Model's action space (use the model's own instance to
+            preserve trained normalization constants; identity is OK for a
+            first labeling pass).
+        out_path: ``.pt`` file to write (parent dirs created).
         n_t0_per_clip: Max ``t0_us`` samples per clip.
         min_gap_s: Minimum seconds between consecutive ``t0_us`` samples.
-        loader: ``(clip_id, t0_us) -> dict`` loader. Defaults to
-            :func:`load_physical_aiavdataset` (lazy-imported).
+        avdi: Optional pre-initialized ``PhysicalAIAVDatasetInterface``. When
+            ``None``, one is lazily created and shared across clips.
         resume: If ``True`` and ``out_path`` exists, skip clip IDs already
             present; new rows are appended.
         max_clips: Optional cap on clip count (useful for smoke tests).
@@ -109,10 +170,10 @@ def build_labeled_cache(
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    if loader is None:  # pragma: no cover — network-dependent
-        from alpamayo1_5.load_physical_aiavdataset import load_physical_aiavdataset as _loader
+    if avdi is None:  # pragma: no cover — network-dependent
+        import physical_ai_av
 
-        loader = _loader
+        avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
 
     actions: list[torch.Tensor] = []
     labels: list[int] = []
@@ -140,35 +201,48 @@ def build_labeled_cache(
 
     for i, cid in enumerate(queue):
         try:
-            duration_us = _estimate_clip_duration_us(loader, cid)
+            egomotion = avdi.get_clip_feature(
+                cid, avdi.features.LABELS.EGOMOTION, maybe_stream=True
+            )
         except Exception as e:  # pragma: no cover
-            logger.warning("duration probe errored for %s: %s", cid, e)
-            duration_us = None
-        if duration_us is None:
+            logger.warning("egomotion fetch failed for %s: %s", cid, e)
             if progress:
                 progress(i + 1, len(queue))
             continue
-        t0_list = sample_t0_us_grid(
-            duration_us,
-            n=n_t0_per_clip,
-            num_history_steps=_NUM_HISTORY_STEPS,
-            num_future_steps=_NUM_FUTURE_STEPS,
-            time_step=_TIME_STEP,
-            min_gap_s=min_gap_s,
-        )
+        try:
+            lo, hi = _valid_t0_range_us(egomotion)
+        except Exception as e:  # pragma: no cover
+            logger.warning("time_range read failed for %s: %s", cid, e)
+            if progress:
+                progress(i + 1, len(queue))
+            continue
+
+        t0_list = _evenly_spaced_t0(lo, hi, n=n_t0_per_clip, min_gap_s=min_gap_s)
         for t0 in t0_list:
             try:
-                data = loader(clip_id=cid, t0_us=t0)
+                sample = _ego_sample(egomotion, t0)
             except Exception as e:  # pragma: no cover
-                logger.warning("load failed clip=%s t0=%d: %s", cid, t0, e)
+                logger.warning("ego sample failed clip=%s t0=%d: %s", cid, t0, e)
                 continue
-            fut_xyz = data["ego_future_xyz"].detach().cpu().numpy()[0, 0]
-            fut_rot = data["ego_future_rot"].detach().cpu().numpy()[0, 0]
+            fut_xyz = sample["ego_future_xyz"].detach().cpu().numpy()[0, 0]
+            fut_rot = sample["ego_future_rot"].detach().cpu().numpy()[0, 0]
             y = label_from_future(fut_xyz, fut_rot, dt=_TIME_STEP)
             if y is None:
                 continue
-            x1 = _extract_action_x1(action_space, data)
-            if x1 is None or not torch.isfinite(x1).all():
+            try:
+                act = action_space.traj_to_action(
+                    sample["ego_history_xyz"],
+                    sample["ego_history_rot"],
+                    sample["ego_future_xyz"],
+                    sample["ego_future_rot"],
+                )
+                if isinstance(act, tuple):
+                    act = act[0]
+                x1 = act.detach().float().cpu().squeeze(0).squeeze(0).contiguous()
+            except Exception as e:  # pragma: no cover
+                logger.warning("traj_to_action failed clip=%s t0=%d: %s", cid, t0, e)
+                continue
+            if not torch.isfinite(x1).all():
                 continue
             actions.append(x1)
             labels.append(int(y))
