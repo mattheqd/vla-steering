@@ -151,6 +151,12 @@ def main() -> None:
                    help="Cap largest class at cap-ratio × second-largest before training.")
     p.add_argument("--downsample-cap-ratio", type=float, default=2.0)
     p.add_argument("--early-stop-patience", type=int, default=8)
+    p.add_argument(
+        "--oversample-factor",
+        type=int,
+        default=1,
+        help="Each x_1 appears N× per epoch with N different (t, x_0) noise draws.",
+    )
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--verbose", action="store_true")
@@ -202,11 +208,16 @@ def main() -> None:
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = torch.nn.CrossEntropyLoss(weight=class_w)
 
-    train_ds = NoisyActionDataset(cache, indices=train_idx, mode="train")
+    train_ds = NoisyActionDataset(
+        cache, indices=train_idx, mode="train",
+        oversample_factor=args.oversample_factor,
+    )
     train_dl = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, drop_last=True,
     )
+    print(f"[train] dataset length per epoch: {len(train_ds)} "
+          f"(={train_idx.size} unique x_1 × oversample {args.oversample_factor})")
 
     fixed_ts = [0.05, 0.15, 0.30, 0.45, 0.60, 0.75, 0.90, 0.95]
 

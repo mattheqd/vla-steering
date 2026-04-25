@@ -79,6 +79,7 @@ class NoisyActionDataset(Dataset):
         mode: str = "train",
         fixed_t: float | None = None,
         seed: int | None = None,
+        oversample_factor: int = 1,
     ) -> None:
         if isinstance(cache, (str, Path)):
             cache = load_labeled_cache(cache)
@@ -97,15 +98,24 @@ class NoisyActionDataset(Dataset):
             raise ValueError(f"mode must be 'train' or 'val', got {mode!r}")
         if mode == "val" and fixed_t is None:
             raise ValueError("val mode requires fixed_t in [0, 1]")
+        if oversample_factor < 1:
+            raise ValueError(f"oversample_factor must be >= 1, got {oversample_factor}")
+        if mode == "val" and oversample_factor != 1:
+            raise ValueError("oversample_factor must be 1 in val mode (each x_1 seen once)")
         self.mode = mode
         self.fixed_t = None if fixed_t is None else float(fixed_t)
         self._val_seed = 0 if seed is None else int(seed)
+        self.oversample_factor = int(oversample_factor)
 
     def __len__(self) -> int:
-        return self._indices.shape[0]
+        return self._indices.shape[0] * self.oversample_factor
 
     def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        idx = int(self._indices[i])
+        # Oversample by wrapping i back into the index range; each pass through
+        # __getitem__ draws fresh (t, x_0) so the same x_1 appears with
+        # different noise contexts within the same epoch.
+        base = i % self._indices.shape[0]
+        idx = int(self._indices[base])
         x1 = self._actions[idx]
         y = self._labels[idx]
 
